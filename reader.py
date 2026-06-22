@@ -8,117 +8,170 @@ import time
 import threading
 import tempfile
 import msvcrt
-
 import re
 import concurrent.futures
 from collections import Counter
 
-import fitz          # PyMuPDF
+import fitz
 import edge_tts
 import pygame
 
-VOICE        = "ru-RU-SvetlanaNeural"   # fem: SvetlanaNeural, male: DmitryNeural
-RATE         = "+0%"                     # скорость: +20% быстрее, -20% медленнее
-CHUNK        = 800                       # символов за один TTS-запрос
-MARGIN_TOP    = 0.13                     # доля высоты страницы — зона колонтитула сверху
-MARGIN_BOTTOM = 0.08                     # доля высоты страницы — зона колонтитула снизу
+# ─── Настройки ────────────────────────────────────────────────────────────────
+
+VOICE         = "ru-RU-SvetlanaNeural"
+RATE          = "+0%"
+CHUNK         = 800
+MARGIN_TOP    = 0.13
+MARGIN_BOTTOM = 0.08
 
 paused      = False
 should_stop = False
 
+# ─── Регулярки ────────────────────────────────────────────────────────────────
 
-# ─── PDF ──────────────────────────────────────────────────────────────────────
-
-def find_repeated_headers(doc, start_idx: int = 0, sample: int = 30, threshold: float = 0.35):
-    """Возвращает множество текстов, которые повторяются в зонах колонтитулов."""
-    counter = Counter()
-    pages = list(doc)[start_idx: start_idx + sample]
-    n = len(pages)
-    if n == 0:
-        return set()
-    for page in pages:
-        h = page.rect.height
-        for b in page.get_text("blocks"):
-            if b[6] != 0:
-                continue
-            rel_top = b[1] / h
-            rel_bot = b[3] / h
-            if rel_top < 0.15 or rel_bot > 0.85:
-                counter[b[4].strip()] += 1
-    return {t for t, c in counter.items() if t and c / n >= threshold}
-
-
-URL_RE          = re.compile(r'https?://\S+|www\.\S+|\S+\.\S+/\S*', re.IGNORECASE)
+URL_RE           = re.compile(r'https?://\S+|www\.\S+|\S+\.\S+/\S*', re.IGNORECASE)
 TABLE_CAPTION_RE = re.compile(r'^\s*[\*†‡§¶]|^(Примечание|Источник|Note|Source)\b', re.IGNORECASE)
+ENDS_PUNCT_RE    = re.compile(r'[.!?…]$')
+SENTENCE_BREAK   = re.compile(r'(?<=[.!?…])\s+')
 
 
-def overlapping_rects(b_rect, rects):
-    return any(b_rect.intersects(r) for r in rects)
+# ══════════════════════════════════════════════════════════════════════════════
+# PageExtractor — всё что касается извлечения и фильтрации текста
+# ══════════════════════════════════════════════════════════════════════════════
 
+class PageExtractor:
+    """Извлекает чистый текст из страниц PDF, готовый для TTS.
 
-def get_link_rects(page):
-    return [fitz.Rect(lnk["from"]) for lnk in page.get_links() if lnk.get("from")]
+    Фильтрует: колонтитулы, таблицы, подписи к ним, ссылки, URL.
+    Исправляет переносы слов. Определяет заголовки по размеру шрифта.
+    """
 
+    HEADING_RATIO = 1.15   # шрифт >= body_size * HEADING_RATIO → заголовок
 
-def get_table_rects(page):
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(lambda: [fitz.Rect(t.bbox) for t in page.find_tables().tables])
-            return future.result(timeout=1.0)
-    except Exception:
-        return []
+    def __init__(self, doc, start_idx: int = 0):
+        self._repeated  = self._scan_repeated_headers(doc, start_idx)
+        self._body_size = self._detect_body_size(doc, start_idx)
 
+    # ── публичный метод ───────────────────────────────────────────────────────
 
-def process_page(page, repeated):
-    """Извлекает текст одной страницы с фильтрацией."""
-    h       = page.rect.height
-    top     = h * MARGIN_TOP
-    bottom  = h * (1 - MARGIN_BOTTOM)
-    lrects  = get_link_rects(page)
-    trects  = get_table_rects(page)
+    def process(self, page) -> list:
+        """Возвращает список (kind, text): kind = 'heading' | 'body'."""
+        h      = page.rect.height
+        top    = h * MARGIN_TOP
+        bottom = h * (1 - MARGIN_BOTTOM)
 
-    blocks = []
-    for b in page.get_text("blocks"):
-        if b[6] != 0:
-            continue
-        if b[1] < top or b[3] > bottom:
-            continue
-        text = b[4].strip()
-        if not text:
-            continue
-        if text in repeated:
-            continue
-        if re.fullmatch(r'\d+', text):
-            continue
-        b_rect = fitz.Rect(b[:4])
-        if lrects and overlapping_rects(b_rect, lrects):
-            continue
-        if trects and overlapping_rects(b_rect, trects):
-            continue
-        if TABLE_CAPTION_RE.match(text):
-            continue
-        text = URL_RE.sub('', text).strip()
-        if text:
-            blocks.append(text)
+        trects = self._table_rects(page)
+        lrects = [fitz.Rect(lnk["from"]) for lnk in page.get_links() if lnk.get("from")]
 
-    return "\n".join(blocks).strip()
+        segments = []
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            _, y0, _, y1 = b["bbox"]
+            if y0 < top or y1 > bottom:
+                continue
 
+            b_rect = fitz.Rect(b["bbox"])
+            if trects and any(b_rect.intersects(r) for r in trects):
+                continue
+            if lrects and any(b_rect.intersects(r) for r in lrects):
+                continue
 
-def split_chunks(text: str, max_chars: int = CHUNK):
-    """Делит текст на куски по абзацам, не превышая max_chars."""
-    chunks, current = [], ""
-    for para in text.split("\n"):
-        para = para.strip()
-        if not para:
-            continue
-        if len(current) + len(para) + 1 > max_chars and current:
-            chunks.append(current)
-            current = para
-        else:
-            current = (current + " " + para) if current else para
-    if current:
-        chunks.append(current)
-    return chunks
+            text, is_heading = self._parse_block(b)
+            if not text:
+                continue
+            if text in self._repeated:
+                continue
+            if re.fullmatch(r'\d+', text):
+                continue
+            if TABLE_CAPTION_RE.match(text):
+                continue
+
+            text = URL_RE.sub('', text).strip()
+            if not text:
+                continue
+
+            # Пауза TTS после заголовка — добавляем точку если нет знака препинания
+            if is_heading and not ENDS_PUNCT_RE.search(text):
+                text += '.'
+
+            segments.append(('heading' if is_heading else 'body', text))
+
+        return segments
+
+    # ── приватные методы ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _scan_repeated_headers(doc, start_idx: int, sample: int = 30, threshold: float = 0.35) -> set:
+        """Находит текст, повторяющийся в зонах колонтитулов."""
+        counter = Counter()
+        pages = list(doc)[start_idx: start_idx + sample]
+        n = len(pages)
+        if not n:
+            return set()
+        for page in pages:
+            h = page.rect.height
+            for b in page.get_text("blocks"):
+                if b[6] != 0:
+                    continue
+                if b[1] / h < 0.15 or b[3] / h > 0.85:
+                    counter[b[4].strip()] += 1
+        return {t for t, c in counter.items() if t and c / n >= threshold}
+
+    @staticmethod
+    def _detect_body_size(doc, start_idx: int, sample: int = 10) -> float:
+        """Определяет основной размер шрифта (самый частый по символам)."""
+        sizes = Counter()
+        for page in list(doc)[start_idx: start_idx + sample]:
+            for b in page.get_text("dict").get("blocks", []):
+                if b.get("type") != 0:
+                    continue
+                for line in b.get("lines", []):
+                    for span in line.get("spans", []):
+                        t = span["text"].strip()
+                        if t:
+                            sizes[round(span["size"], 1)] += len(t)
+        return sizes.most_common(1)[0][0] if sizes else 11.0
+
+    @staticmethod
+    def _table_rects(page) -> list:
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(
+                    lambda: [fitz.Rect(t.bbox) for t in page.find_tables().tables]
+                )
+                return future.result(timeout=1.0)
+        except Exception:
+            return []
+
+    def _parse_block(self, block) -> tuple:
+        """Возвращает (text, is_heading). Склеивает переносы слов."""
+        raw_lines = []
+        sizes = []
+
+        for line in block.get("lines", []):
+            line_text = "".join(s["text"] for s in line.get("spans", []))
+            raw_lines.append(line_text)
+            for span in line.get("spans", []):
+                if span["text"].strip():
+                    sizes.append(span["size"])
+
+        text = self._fix_hyphens("\n".join(raw_lines))
+
+        avg_size   = sum(sizes) / len(sizes) if sizes else self._body_size
+        is_heading = avg_size >= self._body_size * self.HEADING_RATIO
+
+        return text, is_heading
+
+    @staticmethod
+    def _fix_hyphens(raw: str) -> str:
+        """Убирает переносы слов и склеивает строки."""
+        raw = raw.replace('\xad', '')  # мягкий перенос (U+00AD)
+        # перенос: буква-\nбуква → склеиваем без дефиса
+        raw = re.sub(r'([а-яёА-ЯЁa-zA-Z])-\n([а-яёА-ЯЁa-zA-Z])', r'\1\2', raw)
+        # остальные переводы строк → пробел
+        raw = re.sub(r'\n+', ' ', raw)
+        return raw.strip()
 
 
 # ─── TTS ──────────────────────────────────────────────────────────────────────
@@ -133,7 +186,6 @@ async def generate_audio(text: str) -> bytes:
 
 
 def play_mp3_bytes(data: bytes) -> None:
-    """Сохраняет mp3 во временный файл и воспроизводит через pygame."""
     global should_stop
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         f.write(data)
@@ -173,6 +225,31 @@ def key_listener() -> None:
         time.sleep(0.05)
 
 
+# ─── Текст → чанки ────────────────────────────────────────────────────────────
+
+def split_chunks(text: str, max_chars: int = CHUNK) -> list:
+    """Делит текст на куски до max_chars, предпочитая границы предложений."""
+    if len(text) <= max_chars:
+        return [text] if text.strip() else []
+
+    chunks = []
+    while len(text) > max_chars:
+        # ищем последнюю границу предложения внутри лимита
+        boundary = -1
+        for m in SENTENCE_BREAK.finditer(text[:max_chars]):
+            boundary = m.end()
+        if boundary <= 0:
+            boundary = text[:max_chars].rfind(' ')
+        if boundary <= 0:
+            boundary = max_chars
+        chunks.append(text[:boundary].strip())
+        text = text[boundary:].strip()
+
+    if text:
+        chunks.append(text)
+    return chunks
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -180,11 +257,10 @@ async def main() -> None:
 
     if len(sys.argv) < 2:
         print("Использование:  python reader.py <файл.pdf>")
-        print("Опции:          --голос DmitryNeural  --скорость +20%  --page 5")
+        print("Опции:          --голос DmitryNeural  --скорость +20%  --page 5  --debug")
         sys.exit(1)
 
-    # Разбор аргументов
-    args = sys.argv[1:]
+    args       = sys.argv[1:]
     pdf_path   = None
     start_page = 1
     debug      = False
@@ -212,35 +288,31 @@ async def main() -> None:
         print(f"Файл не найден: {pdf_path}")
         sys.exit(1)
 
+    start_idx = max(0, start_page - 1)
+
     if debug:
-        start_idx = max(0, start_page - 1)
         doc = fitz.open(pdf_path)
-        print(f"\n=== DEBUG: блоки стр. {start_page}–{start_page+2} ===")
+        print(f"\n=== DEBUG: блоки стр. {start_page}–{start_page + 2} ===")
         for pg_i, page in enumerate(list(doc)[start_idx: start_idx + 3]):
             h = page.rect.height
             print(f"\n--- Страница {start_idx + pg_i + 1}  (высота={h:.0f}) ---")
             for b in page.get_text("blocks"):
                 if b[6] != 0:
                     continue
-                rel_top = b[1] / h
-                rel_bot = b[3] / h
                 preview = b[4].strip().replace("\n", " ")[:60]
-                print(f"  y={b[1]:.0f}-{b[3]:.0f}  ({rel_top:.2f}-{rel_bot:.2f})  '{preview}'")
+                print(f"  y={b[1]:.0f}-{b[3]:.0f}  ({b[1]/h:.2f}-{b[3]/h:.2f})  '{preview}'")
         sys.exit(0)
 
     print(f"\n📖  {os.path.basename(pdf_path)}")
-    start_idx = max(0, start_page - 1)
-
-    doc      = fitz.open(pdf_path)
-    total    = len(doc)
-    repeated = find_repeated_headers(doc, start_idx=start_idx)
+    doc       = fitz.open(pdf_path)
+    total     = len(doc)
+    extractor = PageExtractor(doc, start_idx)
 
     print(f"    всего стр.: {total}  |  старт: стр. {start_page}  |  голос: {VOICE}  |  скорость: {RATE}")
     print("    Пробел — пауза/продолжить    Q — выход\n")
 
     pygame.mixer.pre_init(44100, -16, 1, 512)
     pygame.mixer.init()
-
     threading.Thread(target=key_listener, daemon=True).start()
 
     queue = asyncio.Queue(maxsize=2)
@@ -250,13 +322,15 @@ async def main() -> None:
         for pdf_idx in range(start_idx, total):
             if should_stop:
                 break
-            page      = doc[pdf_idx]
-            page_text = await loop.run_in_executor(None, process_page, page, repeated)
-            for chunk in split_chunks(page_text):
+            segments = await loop.run_in_executor(None, extractor.process, doc[pdf_idx])
+            for _kind, text in segments:
                 if should_stop:
                     break
-                audio = await generate_audio(chunk)
-                await queue.put((pdf_idx, audio))
+                for chunk in split_chunks(text):
+                    if should_stop:
+                        break
+                    audio = await generate_audio(chunk)
+                    await queue.put((pdf_idx, audio))
         await queue.put(None)
 
     async def consumer():
