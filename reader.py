@@ -18,6 +18,11 @@ import edge_tts
 import pygame
 from deep_translator import GoogleTranslator
 
+# Tesseract на Windows часто не попадает в PATH текущего процесса
+_TESSERACT_WIN = r"C:\Program Files\Tesseract-OCR"
+if os.path.isdir(_TESSERACT_WIN) and _TESSERACT_WIN not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _TESSERACT_WIN + os.pathsep + os.environ.get("PATH", "")
+
 # ─── Настройки ────────────────────────────────────────────────────────────────
 
 VOICE         = "ru-RU-SvetlanaNeural"
