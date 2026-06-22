@@ -15,6 +15,8 @@ from collections import Counter
 import fitz
 import edge_tts
 import pygame
+from langdetect import detect as langdetect
+from deep_translator import GoogleTranslator
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
 
@@ -33,6 +35,53 @@ URL_RE           = re.compile(r'https?://\S+|www\.\S+|\S+\.\S+/\S*', re.IGNORECA
 TABLE_CAPTION_RE = re.compile(r'^\s*[\*†‡§¶]|^(Примечание|Источник|Note|Source)\b', re.IGNORECASE)
 ENDS_PUNCT_RE    = re.compile(r'[.!?…]$')
 SENTENCE_BREAK   = re.compile(r'(?<=[.!?…])\s+')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TextTranslator — определение языка и перевод на русский
+# ══════════════════════════════════════════════════════════════════════════════
+
+LANG_NAMES = {
+    'en': 'английского', 'de': 'немецкого', 'fr': 'французского',
+    'es': 'испанского',  'it': 'итальянского', 'zh-cn': 'китайского',
+    'ja': 'японского',   'ko': 'корейского',   'pt': 'португальского',
+    'pl': 'польского',   'uk': 'украинского',
+}
+
+
+class TextTranslator:
+    """Определяет язык документа и переводит текст на русский."""
+
+    def __init__(self):
+        self.source_lang: str = 'ru'
+        self._active: bool    = False
+
+    def detect(self, sample: str) -> str:
+        """Определяет язык по образцу. Возвращает код языка."""
+        try:
+            self.source_lang = langdetect(sample)
+        except Exception:
+            self.source_lang = 'ru'
+        self._active = not self.source_lang.startswith('ru')
+        return self.source_lang
+
+    @property
+    def needs_translation(self) -> bool:
+        return self._active
+
+    @property
+    def lang_label(self) -> str:
+        return LANG_NAMES.get(self.source_lang, self.source_lang)
+
+    def translate(self, text: str) -> str:
+        """Переводит текст на русский. При ошибке возвращает оригинал."""
+        if not self._active or not text.strip():
+            return text
+        try:
+            result = GoogleTranslator(source=self.source_lang, target='ru').translate(text)
+            return result or text
+        except Exception:
+            return text
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -308,7 +357,18 @@ async def main() -> None:
     total     = len(doc)
     extractor = PageExtractor(doc, start_idx)
 
-    print(f"    всего стр.: {total}  |  старт: стр. {start_page}  |  голос: {VOICE}  |  скорость: {RATE}")
+    # Определяем язык по первым абзацам начальной страницы
+    translator = TextTranslator()
+    sample_segments = extractor.process(doc[start_idx])
+    sample_text = " ".join(t for _, t in sample_segments[:5])
+    if sample_text.strip():
+        lang = translator.detect(sample_text)
+        lang_info = f"перевод с {translator.lang_label}" if translator.needs_translation else "русский"
+    else:
+        lang_info = "—"
+
+    print(f"    всего стр.: {total}  |  старт: стр. {start_page}  |  язык: {lang_info}")
+    print(f"    голос: {VOICE}  |  скорость: {RATE}")
     print("    Пробел — пауза/продолжить    Q — выход\n")
 
     pygame.mixer.pre_init(44100, -16, 1, 512)
@@ -326,6 +386,10 @@ async def main() -> None:
             for _kind, text in segments:
                 if should_stop:
                     break
+                if translator.needs_translation:
+                    text = await loop.run_in_executor(None, translator.translate, text)
+                if not text:
+                    continue
                 for chunk in split_chunks(text):
                     if should_stop:
                         break
