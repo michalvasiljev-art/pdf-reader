@@ -9,6 +9,7 @@ import threading
 import tempfile
 import msvcrt
 import re
+import shutil
 import concurrent.futures
 from collections import Counter
 
@@ -95,20 +96,27 @@ class TextTranslator:
 class PageExtractor:
     """Извлекает чистый текст из страниц PDF, готовый для TTS.
 
-    Фильтрует: колонтитулы, таблицы, подписи к ним, ссылки, URL.
+    Для обычных PDF: блочный разбор с фильтрами (колонтитулы, таблицы, ссылки).
+    Для сканов: OCR через Tesseract (если установлен).
     Исправляет переносы слов. Определяет заголовки по размеру шрифта.
     """
 
-    HEADING_RATIO = 1.15   # шрифт >= body_size * HEADING_RATIO → заголовок
+    HEADING_RATIO  = 1.15   # шрифт >= body_size * HEADING_RATIO → заголовок
+    SCAN_TEXT_MAX  = 50     # символов — меньше этого = страница считается сканом
 
     def __init__(self, doc, start_idx: int = 0):
-        self._repeated  = self._scan_repeated_headers(doc, start_idx)
-        self._body_size = self._detect_body_size(doc, start_idx)
+        self._repeated    = self._scan_repeated_headers(doc, start_idx)
+        self._body_size   = self._detect_body_size(doc, start_idx)
+        self.ocr_available = shutil.which('tesseract') is not None
 
     # ── публичный метод ───────────────────────────────────────────────────────
 
     def process(self, page) -> list:
         """Возвращает список (kind, text): kind = 'heading' | 'body'."""
+        # Скан: мало текста, есть изображения — пускаем через OCR
+        if self.ocr_available and self._is_scanned(page):
+            return self._ocr_page(page)
+
         h      = page.rect.height
         top    = h * MARGIN_TOP
         bottom = h * (1 - MARGIN_BOTTOM)
@@ -215,6 +223,36 @@ class PageExtractor:
         is_heading = avg_size >= self._body_size * self.HEADING_RATIO
 
         return text, is_heading
+
+    def _is_scanned(self, page) -> bool:
+        """True если страница — скан: мало текста, но есть изображения."""
+        text   = page.get_text().strip()
+        images = page.get_images(full=False)
+        return len(images) > 0 and len(text) < self.SCAN_TEXT_MAX
+
+    def _ocr_page(self, page) -> list:
+        """OCR скана через Tesseract (встроен в PyMuPDF). Возвращает сегменты."""
+        try:
+            tp  = page.get_textpage_ocr(language='rus+eng', dpi=300, full=False)
+            raw = page.get_text(textpage=tp)
+        except Exception:
+            return []
+
+        text = self._fix_hyphens(raw)
+        if not text:
+            return []
+
+        segments = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or re.fullmatch(r'\d+', line):
+                continue
+            # Короткая строка без знака препинания в конце — вероятно заголовок
+            if len(line) < 80 and not ENDS_PUNCT_RE.search(line) and line[0].isupper():
+                segments.append(('heading', line + '.'))
+            else:
+                segments.append(('body', line))
+        return segments
 
     @staticmethod
     def _fix_hyphens(raw: str) -> str:
@@ -371,8 +409,9 @@ async def main() -> None:
     else:
         lang_info = "—"
 
+    ocr_status = "✓ Tesseract" if extractor.ocr_available else "✗ Tesseract не найден (сканы пропускаются)"
     print(f"    всего стр.: {total}  |  старт: стр. {start_page}  |  язык: {lang_info}")
-    print(f"    голос: {VOICE}  |  скорость: {RATE}")
+    print(f"    голос: {VOICE}  |  скорость: {RATE}  |  OCR: {ocr_status}")
     print("    Пробел — пауза/продолжить    Q — выход\n")
 
     pygame.mixer.pre_init(44100, -16, 1, 512)
