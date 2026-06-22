@@ -2,4 +2,3 @@ PyMuPDF
 edge-tts
 pygame
 deep-translator
-langdetect

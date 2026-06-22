@@ -15,7 +15,6 @@ from collections import Counter
 import fitz
 import edge_tts
 import pygame
-from langdetect import detect as langdetect
 from deep_translator import GoogleTranslator
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
@@ -57,12 +56,15 @@ class TextTranslator:
         self._active: bool    = False
 
     def detect(self, sample: str) -> str:
-        """Определяет язык по образцу. Возвращает код языка."""
-        try:
-            self.source_lang = langdetect(sample)
-        except Exception:
+        """Определяет язык по доле кириллицы. Не-русский → Google auto-detect."""
+        cyrillic = sum(1 for c in sample if 'Ѐ' <= c <= 'ӿ')
+        ratio = cyrillic / max(len(sample), 1)
+        if ratio > 0.25:
             self.source_lang = 'ru'
-        self._active = not self.source_lang.startswith('ru')
+            self._active = False
+        else:
+            self.source_lang = 'auto'
+            self._active = True
         return self.source_lang
 
     @property
@@ -71,6 +73,8 @@ class TextTranslator:
 
     @property
     def lang_label(self) -> str:
+        if self.source_lang == 'auto':
+            return 'авто-определение'
         return LANG_NAMES.get(self.source_lang, self.source_lang)
 
     def translate(self, text: str) -> str:
