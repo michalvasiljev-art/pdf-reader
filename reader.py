@@ -28,11 +28,18 @@ if os.path.isdir(_TESSERACT_WIN) and _TESSERACT_WIN not in os.environ.get("PATH"
 VOICE         = "ru-RU-SvetlanaNeural"
 RATE          = "+0%"
 CHUNK         = 800
-MARGIN_TOP    = 0.13
-MARGIN_BOTTOM = 0.08
+MARGIN_TOP    = 0.08   # колонтитулы у академических изданий обычно в верхних 3-7%
+MARGIN_BOTTOM = 0.05
 
 paused      = False
 should_stop = False
+VERBOSE     = False
+
+
+def log(msg: str) -> None:
+    """Печатает диагностику с таймингом, если включён --лог."""
+    if VERBOSE:
+        print(f"    · {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 # ─── Регулярки ────────────────────────────────────────────────────────────────
 
@@ -73,6 +80,11 @@ class TextTranslator:
             self._active = True
         return self.source_lang
 
+    def force(self, lang_code: str) -> None:
+        """Принудительно задаёт исходный язык (CLI --язык). Включает перевод, если язык не русский."""
+        self.source_lang = lang_code
+        self._active = (lang_code != 'ru')
+
     @property
     def needs_translation(self) -> bool:
         return self._active
@@ -84,14 +96,36 @@ class TextTranslator:
         return LANG_NAMES.get(self.source_lang, self.source_lang)
 
     def translate(self, text: str) -> str:
-        """Переводит текст на русский. При ошибке возвращает оригинал."""
+        """Переводит текст на русский. При ошибке возвращает пустую строку (чтобы TTS не читал английский)."""
         if not self._active or not text.strip():
             return text
-        try:
-            result = GoogleTranslator(source=self.source_lang, target='ru').translate(text)
-            return result or text
-        except Exception:
-            return text
+        src_stripped = text.strip()
+        for attempt in range(3):
+            try:
+                t0 = time.monotonic()
+                result = GoogleTranslator(source=self.source_lang, target='ru').translate(text)
+                log(f"перевод: {len(text)} симв., попытка {attempt+1} за {time.monotonic()-t0:.1f}s")
+                if result and result.strip():
+                    res_stripped = result.strip()
+                    # 1) Google иногда молча возвращает оригинал — это не перевод.
+                    if res_stripped.lower() == src_stripped.lower():
+                        pass  # retry
+                    else:
+                        # 2) Русский перевод обязан содержать кириллицу. Если буквы
+                        #    есть, а кириллицы нет — Google вернул оригинал (частая
+                        #    беда на коротких заголовках вроде "Results"). Такой текст
+                        #    нельзя читать русским голосом по-английски — retry/пропуск.
+                        cyrillic = sum(1 for c in result if 'Ѐ' <= c <= 'ӿ')
+                        letters  = sum(1 for c in result if c.isalpha())
+                        if letters == 0 or cyrillic / letters >= 0.20:
+                            return result
+                        # иначе — оригинал/частичный сбой, retry
+            except Exception as e:
+                log(f"перевод: ошибка попытка {attempt+1}: {type(e).__name__}: {e}")
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+        log(f"перевод: НЕ УДАЛОСЬ после 3 попыток — фрагмент пропущен ({src_stripped[:50]!r})")
+        return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -120,27 +154,62 @@ class PageExtractor:
         """Возвращает список (kind, text): kind = 'heading' | 'body'."""
         # Скан: мало текста, есть изображения — пускаем через OCR
         if self.ocr_available and self._is_scanned(page):
-            return self._ocr_page(page)
+            return self._merge_lines(self._ocr_page(page))
 
+        # 1) Полная фильтрация (поля + таблицы + ссылки)
+        segments = self._extract(page, drop_margins=True, drop_tables=True, drop_links=True)
+        # 2) Фолбэк: без табличного фильтра (find_tables() часто ложно срабатывает на многоколоночном тексте)
+        if not segments:
+            segments = self._extract(page, drop_margins=True, drop_tables=False, drop_links=False)
+        # 3) Последний фолбэк: всё кроме повторяющихся колонтитулов и пустых блоков
+        if not segments:
+            segments = self._extract(page, drop_margins=False, drop_tables=False, drop_links=False)
+        return self._merge_lines(segments)
+
+    @staticmethod
+    def _merge_lines(segments: list) -> list:
+        """Склеивает подряд идущие body-строки в абзацы.
+
+        В части PDF каждая визуальная строка — отдельный блок. Если озвучивать их
+        по одной, edge-TTS завершает каждую строку падающей интонацией и паузой,
+        причём разрыв приходится посреди предложения. Склейка в связный текст
+        убирает «рубленое» чтение; split_chunks потом делит уже по границам
+        предложений. Заголовки не сливаются — их пауза уместна.
+        """
+        merged = []
+        for kind, text in segments:
+            if kind == 'body' and merged and merged[-1][0] == 'body':
+                prev = merged[-1][1]
+                # перенос слова на границе строк: 'ap-' + 'proaches' → 'approaches'
+                if re.search(r'[а-яёА-ЯЁa-zA-Z]-$', prev) and text[:1].isalpha():
+                    prev = prev[:-1] + text
+                else:
+                    prev = prev + ' ' + text
+                merged[-1] = (kind, prev)
+            else:
+                merged.append((kind, text))
+        return merged
+
+    def _extract(self, page, drop_margins: bool, drop_tables: bool, drop_links: bool) -> list:
         h      = page.rect.height
         top    = h * MARGIN_TOP
         bottom = h * (1 - MARGIN_BOTTOM)
 
-        trects = self._table_rects(page)
-        lrects = [fitz.Rect(lnk["from"]) for lnk in page.get_links() if lnk.get("from")]
+        trects = self._table_rects(page) if drop_tables else []
+        lrects = [fitz.Rect(lnk["from"]) for lnk in page.get_links() if lnk.get("from")] if drop_links else []
 
         segments = []
         for b in page.get_text("dict").get("blocks", []):
             if b.get("type") != 0:
                 continue
             _, y0, _, y1 = b["bbox"]
-            if y0 < top or y1 > bottom:
+            if drop_margins and (y0 < top or y1 > bottom):
                 continue
 
             b_rect = fitz.Rect(b["bbox"])
-            if trects and any(b_rect.intersects(r) for r in trects):
+            if trects and self._coverage(b_rect, trects) >= 0.5:
                 continue
-            if lrects and any(b_rect.intersects(r) for r in lrects):
+            if lrects and self._coverage(b_rect, lrects) >= 0.5:
                 continue
 
             text, is_heading = self._parse_block(b)
@@ -198,6 +267,25 @@ class PageExtractor:
                         if t:
                             sizes[round(span["size"], 1)] += len(t)
         return sizes.most_common(1)[0][0] if sizes else 11.0
+
+    @staticmethod
+    def _coverage(block_rect, rects) -> float:
+        """Доля площади блока, накрытая rects (0..1).
+
+        Чтобы крошечная встроенная ссылка/перекрёстная ссылка (напр.
+        «(see Section 1.5)») не выкидывала весь абзац: блок отбрасываем,
+        только если он практически ЦЕЛИКОМ — ссылка или таблица.
+        """
+        area = (block_rect.x1 - block_rect.x0) * (block_rect.y1 - block_rect.y0)
+        if area <= 0:
+            return 0.0
+        covered = 0.0
+        for r in rects:
+            ix0 = max(block_rect.x0, r.x0); iy0 = max(block_rect.y0, r.y0)
+            ix1 = min(block_rect.x1, r.x1); iy1 = min(block_rect.y1, r.y1)
+            if ix1 > ix0 and iy1 > iy0:
+                covered += (ix1 - ix0) * (iy1 - iy0)
+        return covered / area
 
     @staticmethod
     def _table_rects(page) -> list:
@@ -273,11 +361,13 @@ class PageExtractor:
 # ─── TTS ──────────────────────────────────────────────────────────────────────
 
 async def generate_audio(text: str) -> bytes:
+    t0 = time.monotonic()
     communicate = edge_tts.Communicate(text, VOICE, rate=RATE)
     data = b""
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             data += chunk["data"]
+    log(f"TTS: {len(text)} симв. → {len(data)} байт за {time.monotonic()-t0:.1f}s")
     return data
 
 
@@ -287,11 +377,14 @@ def play_mp3_bytes(data: bytes) -> None:
         f.write(data)
         tmp = f.name
     try:
+        t0 = time.monotonic()
+        log(f"воспроизведение {len(data)} байт…")
         pygame.mixer.music.load(tmp)
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy() and not should_stop:
             time.sleep(0.05)
         pygame.mixer.music.stop()
+        log(f"воспроизведено за {time.monotonic()-t0:.1f}s")
     finally:
         try:
             os.unlink(tmp)
@@ -353,13 +446,17 @@ async def main() -> None:
 
     if len(sys.argv) < 2:
         print("Использование:  python reader.py <файл.pdf>")
-        print("Опции:          --голос DmitryNeural  --скорость +20%  --page 5  --debug")
+        print("Опции:          --голос DmitryNeural  --скорость +20%  --page 5  --абзац 3")
+        print("                --язык en  (форсировать перевод с английского, если детект промахнулся)")
+        print("                --лог  (диагностика с таймингами: где виснет)  --debug")
         sys.exit(1)
 
-    args       = sys.argv[1:]
-    pdf_path   = None
-    start_page = 1
-    debug      = False
+    args         = sys.argv[1:]
+    pdf_path     = None
+    start_page   = 1
+    start_para   = 1
+    forced_lang  = None
+    debug        = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -372,8 +469,17 @@ async def main() -> None:
         elif a == "--page" and i + 1 < len(args):
             start_page = int(args[i + 1])
             i += 2
+        elif a == "--абзац" and i + 1 < len(args):
+            start_para = int(args[i + 1])
+            i += 2
+        elif a == "--язык" and i + 1 < len(args):
+            forced_lang = args[i + 1].lower()
+            i += 2
         elif a == "--debug":
             debug = True
+            i += 1
+        elif a in ("--лог", "--log", "--verbose"):
+            globals()["VERBOSE"] = True
             i += 1
         else:
             if not a.startswith("--"):
@@ -404,18 +510,24 @@ async def main() -> None:
     total     = len(doc)
     extractor = PageExtractor(doc, start_idx)
 
-    # Определяем язык по первым абзацам начальной страницы
+    # Определяем язык по первым абзацам начальной страницы (либо форсируем через --язык)
     translator = TextTranslator()
-    sample_segments = extractor.process(doc[start_idx])
-    sample_text = " ".join(t for _, t in sample_segments[:5])
-    if sample_text.strip():
-        lang = translator.detect(sample_text)
-        lang_info = f"перевод с {translator.lang_label}" if translator.needs_translation else "русский"
+    if forced_lang:
+        translator.force(forced_lang)
+        lang_info = (f"форсирован перевод с {translator.lang_label}"
+                     if translator.needs_translation else "форсирован русский (без перевода)")
     else:
-        lang_info = "—"
+        sample_segments = extractor.process(doc[start_idx])
+        sample_text = " ".join(t for _, t in sample_segments[:5])
+        if sample_text.strip():
+            translator.detect(sample_text)
+            lang_info = f"перевод с {translator.lang_label}" if translator.needs_translation else "русский"
+        else:
+            lang_info = "—"
 
     ocr_status = "✓ Tesseract" if extractor.ocr_available else "✗ Tesseract не найден (сканы пропускаются)"
-    print(f"    всего стр.: {total}  |  старт: стр. {start_page}  |  язык: {lang_info}")
+    para_info = f", абзац {start_para}" if start_para > 1 else ""
+    print(f"    всего стр.: {total}  |  старт: стр. {start_page}{para_info}  |  язык: {lang_info}")
     print(f"    голос: {VOICE}  |  скорость: {RATE}  |  OCR: {ocr_status}")
     print("    Пробел — пауза/продолжить    Q — выход\n")
 
@@ -426,24 +538,61 @@ async def main() -> None:
     queue = asyncio.Queue(maxsize=2)
     loop  = asyncio.get_event_loop()
 
+    async def safe_put(item):
+        """put в очередь, но прерываемый по should_stop (иначе producer виснет, если consumer уже ушёл)."""
+        while not should_stop:
+            try:
+                queue.put_nowait(item)
+                return
+            except asyncio.QueueFull:
+                log("очередь заполнена — жду consumer (идёт воспроизведение)")
+                await asyncio.sleep(0.1)
+
     async def producer():
         for pdf_idx in range(start_idx, total):
             if should_stop:
                 break
+            t0 = time.monotonic()
             segments = await loop.run_in_executor(None, extractor.process, doc[pdf_idx])
+            log(f"стр. {pdf_idx+1}: извлечение {time.monotonic()-t0:.1f}s → {len(segments)} сегм.")
+            if pdf_idx == start_idx and start_para > 1:
+                segments = segments[start_para - 1:]
+
+            translation_failures = 0
+            chunks_queued        = 0
+
             for _kind, text in segments:
                 if should_stop:
                     break
-                if translator.needs_translation:
-                    text = await loop.run_in_executor(None, translator.translate, text)
-                if not text:
-                    continue
                 for chunk in split_chunks(text):
                     if should_stop:
                         break
+                    if translator.needs_translation:
+                        log(f"стр. {pdf_idx+1}: перевожу чанк {len(chunk)} симв.…")
+                        chunk = await loop.run_in_executor(None, translator.translate, chunk)
+                        if not chunk:
+                            translation_failures += 1
+                            continue
+                    if not chunk:
+                        continue
                     audio = await generate_audio(chunk)
-                    await queue.put((pdf_idx, audio))
-        await queue.put(None)
+                    if should_stop:
+                        break
+                    await safe_put((pdf_idx, audio))
+                    chunks_queued += 1
+
+            # Если в очередь ничего не попало — пользователь увидит «прыжок номеров»
+            # без объяснения. Печатаем явную причину, чтобы было понятно что произошло.
+            if chunks_queued == 0 and not should_stop:
+                if not segments:
+                    reason = "нет извлекаемого текста (картинка/таблица/слишком широкие поля)"
+                elif translation_failures > 0:
+                    reason = f"перевод не удался ({translation_failures} фрагмент(ов))"
+                else:
+                    reason = "весь текст отфильтрован (повторяющиеся колонтитулы/ссылки/таблицы)"
+                print(f"  ⚠  стр. {pdf_idx + 1}/{total}: {reason}")
+
+        await safe_put(None)
 
     async def consumer():
         current_page = -1
